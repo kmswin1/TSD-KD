@@ -37,7 +37,7 @@ accelerate launch --config_file accelerate_ddp_config.yaml train.py \
 Hugging Face Path: Minsang/TSD-KD-Qwen2.5-1.5B-Instruct-Gen
 
 ## Citation
-If you use any part of this code and pretrained weights for your purpose, please cite our [paper](https://arxiv.org/pdf/2406.14277).
+If you use any part of this code and pretrained weights for your purpose, please cite our [paper](https://openreview.net/pdf?id=zph7e5JaXc).
 ```
 @InProceedings{
   title = 	 {QPaug: Question and Passage Augmentation for Open-Domain Question Answering of LLMs},
