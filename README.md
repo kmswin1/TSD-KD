@@ -2,6 +2,8 @@
 Explain in Your Own Words: Improving Reasoning via Token-Selective Dual Knowledge Distillation
 
 #### Download self-generated instruction data from [tsd-kd-qwen2.5-1.5b-instruct](https://huggingface.co/datasets/Minsang/TSD-KD-Qwen2.5-1.5B-Instruct-Gen)
+Note: You only use the prompts during on-policy KD.
+* For off-policy distillation, you can also download data from [tsd-kd-qwen2.5-14b-instruct](https://huggingface.co/datasets/Minsang/TSD-KD-Qwen2.5-14B-Instruct-Gen) and train using LAMBDA=0.0.
 
 ## TSD-KD Training Guide
 1. Requirements Installation
