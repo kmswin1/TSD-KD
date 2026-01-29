@@ -35,8 +35,6 @@ accelerate launch --config_file accelerate_ddp_config.yaml train.py \
     --indirect_kd_alpha $INDIRECT_KD_ALPHA
 ```
 
-3. Dataset Reference
-Hugging Face Path: Minsang/TSD-KD-Qwen2.5-1.5B-Instruct-Gen
 
 ## Citation
 If you use any part of this code and pretrained weights for your purpose, please cite our [paper](https://openreview.net/pdf?id=zph7e5JaXc).
