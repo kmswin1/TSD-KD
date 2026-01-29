@@ -101,7 +101,7 @@ def indirect_kd_loss(
     # 6. Mean normalization (optional)
     sorted_student_logits = sorted_student_logits - sorted_student_logits.mean(dim=2, keepdim=True)
 
-    # 7. Compute ListMLE loss: -sum log-softmax
+    # 7. Compute loss: -sum log-softmax
     log_cumsum_exp = torch.logcumsumexp(sorted_student_logits, dim=2)
     log_probs = sorted_student_logits - log_cumsum_exp
     loss = -log_probs.sum(dim=2)  # [B, L]
