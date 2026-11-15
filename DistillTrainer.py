@@ -56,64 +56,83 @@ if is_peft_available():
 if is_wandb_available():
     import wandb
 
-def normalize_entropy(entropy):
-    total_entropy = entropy.sum(dim=-1, keepdim=True)  # [B, 1]
-    norm_entropy = entropy / total_entropy             # [B, T]
-    return norm_entropy
-
-def top_k_entropy_position(norm_entropy, top_p=0.1):
-    """
-    norm_entropy: [B, T] (normalized so that sum = 1)
-    Returns: [B] index where cumulative entropy surpasses (1 - top_p)
-    """
-    cum_entropy = torch.cumsum(norm_entropy, dim=-1)  # [B, T]
-    threshold = top_p
-    
-    mask = cum_entropy >= threshold                    # [B, T]
-    first_idx = mask.float().argmax(dim=-1)            # [B]
-    return first_idx
-
-def indirect_kd_loss(
-    student_logits, teacher_logits, mask=None, T=1.0, K=10
-):
-    B, L, V = student_logits.shape
-
-    # 1. Temperature scaling
-    student_logits = student_logits / T
-    teacher_logits = teacher_logits / T
-
-    # 2. Get student Top-K candidate indices
-    student_topk_logits, student_topk_indices = torch.topk(student_logits, K, dim=2)
-
-    # 3. Get teacher logits on student-selected candidates
-    teacher_topk_logits = torch.gather(teacher_logits, dim=2, index=student_topk_indices)
-
-    # 4. Get permutation (descending) of teacher logits on those candidates
-    teacher_sorted_idx = torch.argsort(teacher_topk_logits, dim=2, descending=True)  # [B, L, K]
-
-    # 5. Apply that permutation to student logits (i.e., sort student_topk_logits by teacher ranking)
-    batch_indices = torch.arange(B).view(B, 1, 1).expand(B, L, K)
-    seq_indices = torch.arange(L).view(1, L, 1).expand(B, L, K)
-    sorted_student_logits = student_topk_logits[
-        batch_indices, seq_indices, teacher_sorted_idx
-    ]  # [B, L, K], sorted by teacher preference
-
-    # 6. Mean normalization (optional)
-    sorted_student_logits = sorted_student_logits - sorted_student_logits.mean(dim=2, keepdim=True)
-
-    # 7. Compute loss: -sum log-softmax
-    log_cumsum_exp = torch.logcumsumexp(sorted_student_logits, dim=2)
-    log_probs = sorted_student_logits - log_cumsum_exp
-    loss = -log_probs.sum(dim=2)  # [B, L]
-
-    # 8. Apply mask if provided
+def normalize_entropy(entropy, mask=None):
+    """Normalize entropy independently for each response over valid tokens."""
+    entropy = entropy.float()
     if mask is not None:
-        loss = loss * mask
-        loss = loss.sum() / (mask.sum() + 1e-8)
-    else:
-        loss = loss.mean()
+        entropy = entropy.masked_fill(~mask.bool(), 0.0)
+    total = entropy.sum(dim=-1, keepdim=True)
+    return entropy / total.clamp_min(torch.finfo(entropy.dtype).tiny)
 
-    return loss
+
+def top_k_entropy_position(norm_entropy, top_p=0.1, mask=None):
+    """Return per-response *lengths* (not indices) of cumulative-entropy openers.
+
+    Includes the token that first brings cumulative entropy to ``top_p``.
+    Zero-valid-token rows have length zero.  Assumes response starts at column 0.
+    """
+    if not 0.0 <= top_p <= 1.0:
+        raise ValueError("top_p must be in [0, 1]")
+    B, L = norm_entropy.shape
+    if L == 0 or top_p == 0:
+        return torch.zeros(B, dtype=torch.long, device=norm_entropy.device)
+    if mask is None:
+        mask = torch.ones_like(norm_entropy, dtype=torch.bool)
+    else:
+        mask = mask.bool()
+
+    cumulative = norm_entropy.float().cumsum(dim=-1)
+    reaches = (cumulative >= top_p) & mask
+    has_valid = mask.any(dim=-1)
+    # If a response contains only zero-entropy tokens, include its first
+    # valid token so that the opener is not silently empty.
+    first = torch.where(reaches.any(dim=-1), reaches.long().argmax(dim=-1),
+                        mask.long().argmax(dim=-1))
+    return torch.where(has_valid, first + 1, torch.zeros_like(first))
+
+
+def select_top_entropy_tokens(entropies, mask, ratio=0.1):
+    """Select exactly ceil(ratio * valid_length) highest-entropy tokens per row."""
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("ratio must be in [0, 1]")
+    mask = mask.bool()
+    num_valid = mask.sum(dim=-1)
+    num_to_keep = torch.ceil(num_valid.float() * ratio).long()
+    if entropies.size(1) == 0:
+        return mask
+    # Stable ordering breaks entropy ties by the original token position.
+    scores = entropies.detach().float().masked_fill(~mask, -float("inf"))
+    ordering = torch.argsort(scores, dim=-1, descending=True, stable=True)
+    ranks = torch.argsort(ordering, dim=-1)
+    return mask & (ranks < num_to_keep.unsqueeze(-1))
+
+
+def indirect_kd_loss(student_logits, teacher_logits, mask=None, T=1.0, K=10):
+    """PL negative log likelihood for the teacher's descending candidate order."""
+    B, L, V = student_logits.shape
+    if T <= 0:
+        raise ValueError("T must be positive")
+    if K < 1:
+        raise ValueError("K must be >= 1")
+    if L == 0 or (mask is not None and not bool(mask.any())):
+        return student_logits.sum() * 0.0
+
+    # Compute ranking scores in FP32 for numerical robustness under AMP.
+    student = student_logits.float() / T
+    teacher = teacher_logits.float() / T
+    k = min(K, V)
+    top_student, candidate_indices = torch.topk(student, k, dim=-1)
+    teacher_on_candidates = torch.gather(teacher, dim=-1, index=candidate_indices)
+    teacher_preference = torch.argsort(teacher_on_candidates, dim=-1, descending=True)
+    ranked_student = torch.gather(top_student, dim=-1, index=teacher_preference)
+    # PL conditions on the candidates remaining at each stage (suffix sum).
+    log_suffix = torch.logcumsumexp(ranked_student.flip(-1), dim=-1).flip(-1)
+    per_token_loss = -(ranked_student - log_suffix).sum(dim=-1)
+
+    if mask is not None:
+        valid = mask.to(dtype=per_token_loss.dtype)
+        return (per_token_loss * valid).sum() / valid.sum().clamp_min(1)
+    return per_token_loss.mean()
 
 
 class DistillTrainer(SFTTrainer):
@@ -171,254 +190,3 @@ class DistillTrainer(SFTTrainer):
                 if teacher_model_init_kwargs["torch_dtype"] in ["auto", None]
                 else getattr(torch, teacher_model_init_kwargs["torch_dtype"])
             )
-
-        if isinstance(teacher_model, str):
-            teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
-
-        # Disable dropout in the model
-        if args.disable_dropout:
-            disable_dropout_in_model(self.model)
-
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-        else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
-
-        self.lmbda = args.lmbda
-        self.beta = args.beta
-        self.temperature = args.temperature
-        self.seq_kd = args.seq_kd
-        self.token_entropy_percentile_threshold = token_entropy_percentile_threshold
-        self.indirect_kd_alpha = indirect_kd_alpha
-        self.generation_config = GenerationConfig(
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            do_sample=True,
-            top_k=0,
-            use_cache=False if args.gradient_checkpointing else True,
-            pad_token_id=self.processing_class.pad_token_id,
-        )
-        # Set custom EOS tokens if they are specified by the model's generation
-        # config. This is important for models with the Llama 3 chat template,
-        # which use special tokens <|eot_id|> and <|eom_id|> to mark the end of
-        # turns or messages.
-        if (
-            hasattr(self.model.generation_config, "eos_token_id")
-            and self.model.generation_config.eos_token_id is not None
-        ):
-            self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
-
-    @staticmethod
-    def generalized_jsd_loss(
-        student_logits, teacher_logits, labels=None, beta=0.9, temperature=1.0, reduction="batchmean", token_entropy_percentile_threshold=0.1, indirect_kd_alpha=0.1
-    ):
-        """
-        Compute the generalized Jensen-Shannon Divergence loss for knowledge distillation using F.kl_div. See Eq. (1)
-        of https://huggingface.co/papers/2306.13649 for the definition.
-
-        Args:
-            student_logits:
-                Tensor of shape (batch_size, sequence_length, vocab_size)
-            teacher_logits:
-                Tensor of shape (batch_size, sequence_length, vocab_size)
-            labels:
-                Tensor of shape (batch_size, sequence_length) with -100 for padding tokens to ignore when computing
-                loss
-            beta:
-                Interpolation coefficient between 0 and 1 (default: 0.5)
-            temperature:
-                Softmax temperature (default: 1.0)
-            reduction:
-                Specifies the reduction to apply to the output (default: 'batchmean')
-
-        Returns:
-            loss: Scalar tensor with the generalized JSD loss
-        """
-
-        # Apply temperature scaling
-        student_logits = student_logits / temperature
-        teacher_logits = teacher_logits / temperature
-
-        # Compute log probabilities for student and probabilities for teacher
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-        beta = torch.tensor(beta, dtype=student_log_probs.dtype)
-        mixture_log_probs = torch.logsumexp(
-            torch.stack([student_log_probs + torch.log(1 - beta), teacher_log_probs + torch.log(beta)]),
-            dim=0,
-        )
-
-        if labels is not None:
-            mask = labels != -100
-
-        entropies = entropy_from_logits(student_logits)
-        entropies_teacher = entropy_from_logits(teacher_logits)
-        entropy_diff = entropies - entropies_teacher
-        weight = torch.sigmoid(entropy_diff).detach() # stop gradient
-        non_pad_entropies = entropies[mask]
-
-        if non_pad_entropies.numel() == 0:
-            entropy_threshold = float("inf")
-            entropy_mask = torch.zeros_like(entropies, dtype=torch.bool)
-            d_token_len = 0
-        else:
-            entropy_threshold = torch.quantile(non_pad_entropies.float(), token_entropy_percentile_threshold)
-            entropy_mask = entropies >= entropy_threshold
-            normalized_entropies = normalize_entropy(non_pad_entropies.float())
-            d_token_len = top_k_entropy_position(normalized_entropies, token_entropy_percentile_threshold)
-        regularization = entropies * entropy_mask
-
-        topk_loss = indirect_kd_loss(student_logits[:, :d_token_len, :], teacher_logits[:, :d_token_len, :], mask=labels[:, :d_token_len] != -100, K=10)
-
-        if student_logits.size(1) > 0:
-            # Compute the Generalized Jensen-Shannon Divergence
-            kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
-            kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
-            jsd = beta * kl_teacher + (1 - beta) * kl_student
-            jsd = jsd * weight.unsqueeze(-1)
-
-        else:
-            jsd = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
-
-        # Masking
-        if labels is not None:
-            mask = labels != -100
-            jsd = jsd[mask]
-
-        # Apply reduction
-        if reduction == "batchmean":
-            loss =  jsd.sum() / mask.sum() if labels is not None else jsd.sum() / (jsd.size(0) * jsd.size(1))
-            loss += (regularization.sum() / entropy_mask.sum()) 
-            loss += indirect_kd_alpha * topk_loss
-            return loss
-        elif reduction == "sum":
-            return jsd.sum()
-        elif reduction == "mean":
-            return jsd.mean()
-        else:
-            return jsd
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # compute student output
-        outputs_student = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-        )
-
-        # compute teacher output in eval mode
-        self.teacher_model.eval()
-        with torch.no_grad():
-            outputs_teacher = self.teacher_model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-            )
-
-        # slice the logits for the generated tokens using the inputs["prompts"] lengths
-        prompt_lengths = inputs["prompts"].shape[1]
-        shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
-        shifted_teacher_logits = outputs_teacher.logits[:, prompt_lengths - 1 : -1, :]
-        shifted_labels = inputs["labels"][:, prompt_lengths:]
-
-        # compute loss
-        loss = self.generalized_jsd_loss(
-            student_logits=shifted_student_logits,
-            teacher_logits=shifted_teacher_logits,
-            labels=shifted_labels,
-            beta=self.beta,
-            token_entropy_percentile_threshold=self.token_entropy_percentile_threshold,
-            indirect_kd_alpha=self.indirect_kd_alpha,
-        )
-
-        return (loss, outputs_student) if return_outputs else loss
-
-    @staticmethod
-    def generate_on_policy_outputs(model, inputs, generation_config, pad_token_id=None):
-        # Generate output with respect to the prompt only
-        generated_outputs = model.generate(
-            input_ids=inputs["prompts"],
-            attention_mask=inputs.get("prompt_attention_mask", None),
-            generation_config=generation_config,
-            return_dict_in_generate=True,
-        )
-
-        # Get the generated token IDs
-        generated_tokens = generated_outputs.sequences
-        # Calculate new attention mask
-        new_attention_mask = torch.ones_like(generated_tokens)
-        new_labels = generated_tokens.clone()
-
-        # If there's pad_token_id, set attention mask to 0 for padding tokens
-        if pad_token_id is not None:
-            new_labels[new_labels == pad_token_id] = -100
-            new_attention_mask[generated_tokens == pad_token_id] = 0
-
-        return generated_tokens, new_attention_mask, new_labels
-
-    def training_step(
-        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int] = None
-    ) -> torch.Tensor:
-        """
-        Perform a training step for the Generalized Knowledge Distillation (GKD) model.
-
-        This method implements the on-policy learning approach described in the GKD paper. With probability
-        `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
-        the original inputs.
-        """
-        if self.seq_kd:
-            with unwrap_model_for_generation(self.teacher_model, self.accelerator) as unwrapped_model:
-                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                    unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
-                )
-            inputs["input_ids"] = new_input_ids
-            inputs["attention_mask"] = new_attention_mask
-            inputs["labels"] = new_labels
-        if random.random() <= self.lmbda:
-            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                    unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
-                )
-                
-            inputs["input_ids"] = new_input_ids
-            inputs["attention_mask"] = new_attention_mask
-            inputs["labels"] = new_labels
-
-        loss = super().training_step(model, inputs, num_items_in_batch)
-        return loss
-
-    def create_model_card(
-        self,
-        model_name: Optional[str] = None,
-        dataset_name: Optional[str] = None,
-        tags: Union[str, list[str], None] = None,
-    ):
-        """
-        Creates a draft of a model card using the information available to the `Trainer`.
-
-        Args:
-            model_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the model.
-            dataset_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the dataset used for training.
-            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
-                Tags to be associated with the model card.
-        """
-        if not self.is_world_process_zero():
-            return
-
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
-            base_model = self.model.config._name_or_path
-        else:
-            base_model = None
-
-        # normalize `tags` to a mutable set
-        if tags is None:
-            tags = set()
-        elif isinstance(tags, str):
-            tags = {tags}
-        else:
-            tags = set(tags)
-
-        if hasattr(self.model.config, "unsloth_version"):
-            tags.add("unsloth")
-
-        tags.update(self._tag_names)
